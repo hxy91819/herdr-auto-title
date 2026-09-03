@@ -17,6 +17,7 @@ Robustness details:
 - A per-pane merged parking queue persists events that arrive while a pane is already generating, so a settled event can never be silently dropped by the non-blocking pane lock (fixed with observable cross-process tests).
 - User-renamed tabs are never touched; agent-reported OSC titles are reused directly; in multi-pane tabs only the first agent pane speaks for the tab.
 - Generation/revision guards make `reset`/`clear` immune to late provider results.
+- When an installed Herdr agent integration reports a new native `agent_session` (for example after Codex `/new` or `/clear`), the next prompt starts a fresh title lifecycle. The previous plugin title stays visible until that prompt is titled, while a user-renamed tab remains untouched.
 - Titles follow the language of the conversation (Chinese prompts get Chinese titles).
 
 ## Requirements
@@ -72,6 +73,27 @@ python3 -m unittest -v test_e2e_offline   # the cross-process race-scenario suit
 ```
 
 The end-to-end suite replays the real event model (one process per event, herdr-injected environment) against a fake `herdr` CLI and a fake provider, with file-gate timing — fully deterministic, no real provider or session needed.
+
+### Real-environment acceptance
+
+For changes that touch session-identity handling or provider integration, run the real-session acceptance after the offline suites pass:
+
+```bash
+# from inside a Herdr-managed pane (HERDR_ENV=1)
+python3 real_session_check.py                    # default: pi agent, ~6 provider calls
+python3 real_session_check.py -v --keep          # keep the throwaway session for debugging
+python3 real_session_check.py --agent codex      # codex needs --dangerously-bypass-hook-trust
+```
+
+The script creates its own uniquely named throwaway Herdr session (via a temporary `HERDR_CONFIG_PATH` copy that enables `experimental.allow_nested` — shared config is never touched), starts a real coding agent in it, and verifies:
+
+- **S1 baseline** — first prompt produces a T0+T1 titled tab owned by the plugin (`calls>=2`, `draft_done`/`final_done`).
+- **S2 `/new`** — a fresh native session (`agent_session` identity change) resets the lifecycle (`generation` bumps, calls restart) and retitles the tab for the new task.
+- **S3 second rollover** — `/new` again (pi) or `/clear` (codex) retitles once more.
+
+It writes a JSON report to `/var/tmp/real-session-check-<timestamp>.json` and always cleans up the named session and outer pane. Exit codes: `0` pass, `1` plugin-behavior failure, `2` environment error, `3` pass but session-identity reporting unavailable (identity scenarios blocked).
+
+Notes from real runs: the Codex integration's user-level `SessionStart` hook can be silently skipped by Codex when its hook trust hash is stale, leaving every pane without `agent_session` (identity scenarios then report environment-blocked). Codex also creates threads lazily, so its session report can land ~one prompt late; the pi integration reports synchronously on `session_start` and is the recommended test agent.
 
 ## License
 

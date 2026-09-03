@@ -49,6 +49,11 @@ class AutoTitleBehaviorTests(unittest.TestCase):
             {
                 "HERDR_AUTO_TITLE_STATE_DIR": self.temp_dir.name,
                 "HERDR_PLUGIN_STATE_DIR": "",
+                # 本套件可能直接在 herdr 管理 pane 内跑;剥离会话选择环境,
+                # 否则 ambient HERDR_SESSION/SOCKET_PATH 会给默认态注入 scope
+                "HERDR_SESSION": "",
+                "HERDR_AUTO_TITLE_SESSION": "",
+                "HERDR_SOCKET_PATH": "",
             },
         )
         self.env.start()
@@ -223,6 +228,112 @@ class AutoTitleBehaviorTests(unittest.TestCase):
         self.assertNotIn("pending_settle", entry)
         self.assertEqual(entry["calls"], 2)
         self.assertEqual(tabs["w1:t1"]["label"], "1")
+
+    def test_session_switch_during_provider_consumes_new_draft_and_final(self) -> None:
+        """旧 provider 执行时 /new 不会吞掉新会话的 T0/T1 标题。"""
+        self.configure(target="tab")
+        old_session = {
+            "source": "herdr:pi",
+            "agent": "pi",
+            "kind": "path",
+            "value": "/tmp/pi-old.jsonl",
+        }
+        new_session = {**old_session, "value": "/tmp/pi-new.jsonl"}
+        auto_title.save_state(
+            {
+                "w1:p1": {
+                    "rounds": 0,
+                    "calls": 0,
+                    "last_status": "idle",
+                    "generation": 0,
+                    "revision": 1,
+                    "agent": "pi",
+                    "agent_session": old_session,
+                }
+            }
+        )
+        old_pane = self.make_tab_pane()
+        old_pane["agent_session"] = old_session
+        new_pane = self.make_tab_pane()
+        new_pane["agent_session"] = new_session
+        panes = iter((old_pane, new_pane, new_pane))
+        tabs = {"w1:t1": {"tab_id": "w1:t1", "label": "1", "number": "1"}}
+        contents = iter(
+            (
+                "旧会话的 prompt 内容足够生成初稿",
+                "新会话的 prompt 内容足够生成初稿",
+                "新会话的 prompt 与回复内容足够生成定稿",
+            )
+        )
+        gate = threading.Event()
+        entered_provider = threading.Event()
+        generated_titles = iter(("旧会话初稿", "新会话初稿", "新会话定稿"))
+        provider_current_titles: list[str | None] = []
+        rename_calls: list[str] = []
+        failures: list[BaseException] = []
+
+        def generate(content: str, current_title: str | None) -> str:
+            provider_current_titles.append(current_title)
+            title = next(generated_titles)
+            if not entered_provider.is_set():
+                entered_provider.set()
+                gate.wait(timeout=30)
+            return title
+
+        def rename(tab_id: str, label: str) -> bool:
+            rename_calls.append(label)
+            tabs[tab_id]["label"] = label
+            return True
+
+        event_working = {
+            "data": {"pane_id": "w1:p1", "agent_status": "working", "agent": "pi"}
+        }
+        event_done = {
+            "data": {"pane_id": "w1:p1", "agent_status": "done", "agent": "pi"}
+        }
+
+        def old_session_runner() -> None:
+            try:
+                with (
+                    patch.dict(os.environ, {"HERDR_PLUGIN_EVENT_JSON": json.dumps(event_working)}),
+                    patch.object(auto_title, "get_pane", side_effect=lambda pane_id: next(panes)),
+                    patch.object(auto_title, "list_tabs", return_value=tabs),
+                    patch.object(auto_title, "first_agent_panes", return_value={"w1:t1": "w1:p1"}),
+                    patch.object(auto_title, "read_pane", side_effect=lambda pane_id: next(contents)),
+                    patch.object(auto_title, "generate_title", side_effect=generate),
+                    patch.object(auto_title, "rename_tab", side_effect=rename),
+                ):
+                    auto_title.handle_event()
+            except BaseException as exc:
+                failures.append(exc)
+
+        worker = threading.Thread(target=old_session_runner)
+        worker.start()
+        self.assertTrue(entered_provider.wait(timeout=10), "old session never reached provider")
+
+        # /new 后的 working 与 done 在旧调用持锁期间到达，必须都停靠下来。
+        with patch.dict(os.environ, {"HERDR_PLUGIN_EVENT_JSON": json.dumps(event_working)}):
+            self.assertEqual(auto_title.handle_event(), 0)
+        with patch.dict(os.environ, {"HERDR_PLUGIN_EVENT_JSON": json.dumps(event_done)}):
+            self.assertEqual(auto_title.handle_event(), 0)
+        parked = auto_title.load_state()["w1:p1"]
+        self.assertTrue(parked["pending_draft"])
+        self.assertTrue(parked["pending_settle"])
+
+        gate.set()
+        worker.join(timeout=60)
+        self.assertEqual(failures, [])
+        self.assertEqual(rename_calls, ["旧会话初稿", "新会话初稿", "新会话定稿"])
+        self.assertEqual(provider_current_titles, [None, None, "新会话初稿"])
+        entry = auto_title.load_state()["w1:p1"]
+        self.assertEqual(entry["agent_session"], new_session)
+        self.assertEqual(entry["generation"], 1)
+        self.assertEqual(entry["calls"], 2)
+        self.assertTrue(entry["draft_done"])
+        self.assertTrue(entry["final_done"])
+        self.assertNotIn("pending_draft", entry)
+        self.assertNotIn("pending_settle", entry)
+        self.assertNotIn("session_rollover", entry)
 
     def test_working_event_during_blocked_final_skips_draft_when_final_wins(self) -> None:
         """final 持锁时到达的 working 事件持久化意图;final 已给出标题则 draft 不再烧调用。"""
@@ -480,9 +591,15 @@ class AutoTitleBehaviorTests(unittest.TestCase):
             )
 
     def test_agent_startup_idle_does_not_burn_a_provider_call(self) -> None:
-        """agent 启动 ready 的 idle(unknown→idle)不递增 rounds,不触发 final。"""
+        """即使启动时已上报原生会话，ready 的 idle 也不递增 rounds 或触发 final。"""
         self.configure(target="tab")
         pane = self.make_tab_pane()
+        pane["agent_session"] = {
+            "source": "herdr:pi",
+            "agent": "pi",
+            "kind": "path",
+            "value": "/tmp/pi-startup.jsonl",
+        }
         event = {"data": {"pane_id": "w1:p1", "agent_status": "idle", "agent": "pi"}}
         with (
             patch.dict(os.environ, {"HERDR_PLUGIN_EVENT_JSON": json.dumps(event)}),
@@ -521,6 +638,167 @@ class AutoTitleBehaviorTests(unittest.TestCase):
             auto_title.generate_for("w1:p1", {"tab_title": "已有标题"})
         self.assertEqual(generate.call_args.args[1], "已有标题")
 
+    def test_new_agent_sessions_replace_plugin_titles_once_for_supported_agents(self) -> None:
+        """Codex、Pi、agy 的真实会话引用变更均会开启一次新的标题生命周期。"""
+        cases = (
+            ("codex", "herdr:codex", "codex", "id", "codex-session-new"),
+            ("pi", "herdr:pi", "pi", "path", "/tmp/pi-session-new.jsonl"),
+            ("agy", "herdr:antigravity_cli", "agy", "id", "agy-session-new"),
+        )
+        for agent, source, session_agent, kind, value in cases:
+            with self.subTest(agent=agent):
+                self.configure(target="tab")
+                old_title = f"{agent} 旧插件标题"
+                new_title = f"{agent} 新会话任务"
+                session = {
+                    "source": source,
+                    "agent": session_agent,
+                    "kind": kind,
+                    "value": value,
+                }
+                old_session = {**session, "value": f"{value}-old"}
+                auto_title.save_state(
+                    {
+                        "w1:p1": {
+                            "rounds": 4,
+                            "calls": 6,
+                            "last_status": "idle",
+                            "generation": 12,
+                            "revision": 7,
+                            "agent": agent,
+                            "agent_session": old_session,
+                            "fingerprint": "old-fingerprint",
+                            "draft_done": True,
+                            "final_done": True,
+                            "rechecked": True,
+                            "tab_id": "w1:t1",
+                            "tab_title": old_title,
+                        }
+                    }
+                )
+                pane = self.make_tab_pane()
+                pane["agent_session"] = session
+                tabs = {"w1:t1": {"tab_id": "w1:t1", "label": old_title, "number": "1"}}
+                renamed: list[str] = []
+
+                def rename(tab_id: str, label: str) -> bool:
+                    self.assertEqual(tab_id, "w1:t1")
+                    renamed.append(label)
+                    tabs[tab_id]["label"] = label
+                    return True
+
+                with (
+                    patch.object(auto_title, "get_pane", return_value=pane),
+                    patch.object(auto_title, "list_tabs", return_value=tabs),
+                    patch.object(auto_title, "first_agent_panes", return_value={"w1:t1": "w1:p1"}),
+                    patch.object(auto_title, "read_pane", return_value="new session task content"),
+                    patch.object(auto_title, "generate_title", return_value=new_title) as generate,
+                    patch.object(auto_title, "rename_tab", side_effect=rename),
+                ):
+                    self.assertEqual(
+                        auto_title._handle_event("w1:p1", "working", {"agent": agent}), 0
+                    )
+                    # 同一原生会话的重复 working 事件不能重复调用 provider 或改名。
+                    self.assertEqual(
+                        auto_title._handle_event("w1:p1", "working", {"agent": agent}), 0
+                    )
+
+                self.assertEqual(renamed, [new_title])
+                self.assertEqual(generate.call_count, 1)
+                self.assertIsNone(generate.call_args.args[1])
+                entry = auto_title.load_state()["w1:p1"]
+                self.assertEqual(entry["agent_session"], session)
+                self.assertEqual(entry["generation"], 13)
+                self.assertEqual(entry["rounds"], 0)
+                self.assertEqual(entry["calls"], 1)
+                self.assertTrue(entry["draft_done"])
+                self.assertNotIn("final_done", entry)
+                self.assertNotIn("session_rollover", entry)
+
+    def test_new_agent_session_keeps_user_renamed_tab_untouched(self) -> None:
+        self.configure(target="tab")
+        old_title = "插件原标题"
+        session = {
+            "source": "herdr:codex",
+            "agent": "codex",
+            "kind": "id",
+            "value": "new-session",
+        }
+        auto_title.save_state(
+            {
+                "w1:p1": {
+                    "rounds": 1,
+                    "calls": 2,
+                    "last_status": "idle",
+                    "generation": 0,
+                    "revision": 3,
+                    "agent_session": {**session, "value": "old-session"},
+                    "tab_id": "w1:t1",
+                    "tab_title": old_title,
+                }
+            }
+        )
+        pane = self.make_tab_pane()
+        pane["agent_session"] = session
+        tabs = {"w1:t1": {"tab_id": "w1:t1", "label": "用户标题", "number": "1"}}
+        with (
+            patch.object(auto_title, "get_pane", return_value=pane),
+            patch.object(auto_title, "list_tabs", return_value=tabs),
+            patch.object(auto_title, "first_agent_panes", return_value={"w1:t1": "w1:p1"}),
+            patch.object(auto_title, "generate_title") as generate,
+            patch.object(auto_title, "rename_tab") as rename,
+        ):
+            self.assertEqual(auto_title._handle_event("w1:p1", "working", {"agent": "codex"}), 0)
+        generate.assert_not_called()
+        rename.assert_not_called()
+        entry = auto_title.load_state()["w1:p1"]
+        self.assertEqual(entry["agent_session"], session)
+        self.assertTrue(entry["tab_user_named"])
+        self.assertEqual(entry["tab_title"], old_title)
+
+    def test_missing_or_malformed_agent_session_keeps_existing_lifecycle(self) -> None:
+        """未安装集成或异常上报时不猜测会话边界，保留此前按 pane 去重的行为。"""
+        malformed = (
+            None,
+            {},
+            {"source": "herdr:pi", "agent": "pi", "kind": "path"},
+            {"source": "herdr:pi", "agent": "pi", "kind": "path", "value": ""},
+        )
+        for reported_session in malformed:
+            with self.subTest(reported_session=reported_session):
+                self.configure(target="tab")
+                auto_title.save_state(
+                    {
+                        "w1:p1": {
+                            "rounds": 1,
+                            "calls": 2,
+                            "last_status": "idle",
+                            "generation": 4,
+                            "revision": 8,
+                            "final_done": True,
+                            "tab_id": "w1:t1",
+                            "tab_title": "已有插件标题",
+                        }
+                    }
+                )
+                pane = self.make_tab_pane()
+                pane["agent_session"] = reported_session
+                tabs = {"w1:t1": {"tab_id": "w1:t1", "label": "已有插件标题", "number": "1"}}
+                with (
+                    patch.object(auto_title, "get_pane", return_value=pane),
+                    patch.object(auto_title, "list_tabs", return_value=tabs),
+                    patch.object(auto_title, "first_agent_panes", return_value={"w1:t1": "w1:p1"}),
+                    patch.object(auto_title, "generate_title") as generate,
+                    patch.object(auto_title, "rename_tab") as rename,
+                ):
+                    self.assertEqual(auto_title._handle_event("w1:p1", "working", {"agent": "pi"}), 0)
+                generate.assert_not_called()
+                rename.assert_not_called()
+                entry = auto_title.load_state()["w1:p1"]
+                self.assertTrue(entry["final_done"])
+                self.assertEqual(entry["calls"], 2)
+                self.assertNotIn("agent_session", entry)
+
     def test_state_and_diagnostic_files_are_private(self) -> None:
         auto_title.save_state({"w1:p1": {"calls": 0}})
         auto_title._append_log("INFO", "test")
@@ -556,7 +834,13 @@ class AutoTitleBehaviorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as managed_dir:
             with patch.dict(
                 os.environ,
-                {"HERDR_AUTO_TITLE_STATE_DIR": "", "HERDR_PLUGIN_STATE_DIR": managed_dir},
+                {
+                    "HERDR_AUTO_TITLE_STATE_DIR": "",
+                    "HERDR_PLUGIN_STATE_DIR": managed_dir,
+                    # 本套件可能直接在 herdr 管理 pane 里跑;socket 推导会让
+                    # 默认会话也带 scope,这里显式隔离才能验证"无 scope"分支
+                    "HERDR_SOCKET_PATH": "",
+                },
             ):
                 config = auto_title.Config(args())
         self.assertEqual(config.state_dir, Path(managed_dir))

@@ -109,6 +109,13 @@
        管理,账目提交透明保留;消费前从磁盘重读,reset/clear 递增 generation
        清掉标志后,迟到结果不再触发新的生成。
 
+   11. 原生会话身份是标题生命周期的边界。每个状态事件都会从 `pane get`
+       读取完整的 agent_session(source/agent/kind/value);身份首次出现或变化时,
+       清空上一会话的轮次、指纹和完成标记,让 `/new` / `/clear` 后的下一条
+       prompt 可以重新命名。同一 pane 上旧的插件标题仍用于确认 tab 所有权,
+       但不会作为新会话的“当前标题”传给 provider;人工改名保护保持不变。
+       没有或格式不完整的 agent_session 不推断会话切换,兼容未安装集成的 agent。
+
 ## 调用范例
 
     # 安装(本地开发用 link,改动立即生效)
@@ -178,6 +185,12 @@ STATE_TTL_DAYS = 7
 PARKED_DRAFT = "pending_draft"
 PARKED_SETTLE = "pending_settle"
 PARKED_KEYS = (PARKED_DRAFT, PARKED_SETTLE)
+
+# Herdr 的公开 pane API 对原生 agent 会话使用这四个字段。只有全部为非空
+# 字符串才接受该身份，避免不完整上报把旧会话误判成一次 /new。
+AGENT_SESSION_FIELDS = ("source", "agent", "kind", "value")
+# 会话切换后仍需识别“当前 tab 是本插件写的”，同时绝不能取消用户的人工命名。
+SESSION_OWNERSHIP_KEYS = ("manual", "tab_user_named", "title", "tab_title", "tab_id")
 
 METADATA_SOURCE = "herdr:auto-title"
 NO_TITLE = "NO_TITLE"
@@ -472,6 +485,20 @@ def get_pane(pane_id: str) -> dict | None:
         if isinstance(pane, dict):
             return pane
     return None
+
+
+def agent_session_identity(pane: dict) -> dict[str, str] | None:
+    """标准化 pane API 的原生会话身份；未知/不完整上报保持旧行为。"""
+    raw = pane.get("agent_session")
+    if not isinstance(raw, dict):
+        return None
+    identity: dict[str, str] = {}
+    for field in AGENT_SESSION_FIELDS:
+        value = raw.get(field)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        identity[field] = value.strip()
+    return identity
 
 
 def read_pane(pane_id: str) -> str:
@@ -975,7 +1002,11 @@ def generate_for(pane_id: str, entry: dict) -> str | None:
         debug(f"{pane_id}: pane content too thin to title")
         return None
     digest = fingerprint(content)
-    current_title = entry.get("tab_title") or entry.get("title")
+    # 旧标题仍保留在 entry 中以证明 tab 归本插件所有；但它描述的是上一原生
+    # 会话，传给 provider 会诱导模型“保留”而不是为 /new 后的任务重新命名。
+    current_title = None if entry.get("session_rollover") else (
+        entry.get("tab_title") or entry.get("title")
+    )
     if entry.get("fingerprint") == digest and current_title:
         debug(f"{pane_id}: content unchanged, keeping existing title")
         return current_title
@@ -1031,7 +1062,31 @@ def prepare(
     return (decide(entry, status), tab, None)
 
 
-def begin_event(pane_id: str, status: str, data: dict) -> tuple[dict, int, int]:
+def reset_for_agent_session(entry: dict, session: dict[str, str]) -> dict:
+    """为新的原生 agent 会话重建标题生命周期，保留标题归属与停靠事件。"""
+    next_entry = {
+        "rounds": 0,
+        "calls": 0,
+        "last_status": None,
+        "generation": entry.get("generation", 0) + 1,
+        "revision": entry.get("revision", 0) + 1,
+        "seen": time.time(),
+        "agent": session["agent"],
+        "agent_session": session,
+        "session_rollover": True,
+    }
+    for key in SESSION_OWNERSHIP_KEYS + PARKED_KEYS:
+        if key in entry:
+            next_entry[key] = entry[key]
+    return next_entry
+
+
+def begin_event(
+    pane_id: str,
+    status: str,
+    data: dict,
+    session: dict[str, str] | None,
+) -> tuple[dict, int, int]:
     """记录事件跃变并立即落盘，provider 期间不持有全局状态锁。
 
     返回的快照剥离停靠标志：标志的生命周期由 mark/clear 独占管理，
@@ -1054,13 +1109,23 @@ def begin_event(pane_id: str, status: str, data: dict) -> tuple[dict, int, int]:
                 "revision": 0,
             },
         )
-        entry.setdefault("generation", 0)
-        entry["revision"] = entry.get("revision", 0) + 1
+        if session is not None and entry.get("agent_session") != session:
+            # generation 让正在运行的旧 provider 结果无法提交；revision 同时
+            # 失效当前事件的旧快照。停靠标记由 reset helper 原样带入，确保
+            # 新会话的 T1 不会因切换而丢失。
+            entry = reset_for_agent_session(entry, session)
+            state[pane_id] = entry
+            debug(f"{pane_id}: native agent session changed; restarting title lifecycle")
+        else:
+            entry.setdefault("generation", 0)
+            entry["revision"] = entry.get("revision", 0) + 1
         if status == "idle" and entry.get("last_status") == "working":
             entry["rounds"] = entry.get("rounds", 0) + 1
         entry["last_status"] = status
         entry["seen"] = time.time()
-        entry["agent"] = data.get("agent") or entry.get("agent")
+        entry["agent"] = (
+            session["agent"] if session is not None else data.get("agent") or entry.get("agent")
+        )
         save_state(state)
         snapshot = {k: v for k, v in entry.items() if k not in PARKED_KEYS}
         return snapshot, entry["generation"], entry["revision"]
@@ -1229,11 +1294,12 @@ def consume_pending_events(pane_id: str, data: dict, result: int) -> int:
 
 def _handle_event(pane_id: str, status: str, data: dict) -> int:
     """处理一个 pane 的事件；不同 pane 可并行生成，同 pane 的重复事件会合并。"""
-    entry, generation, revision = begin_event(pane_id, status, data)
-
     pane = get_pane(pane_id)
     if pane is None:
         return 0
+    entry, generation, revision = begin_event(
+        pane_id, status, data, agent_session_identity(pane)
+    )
     if CONFIG.target in ("tab", "both"):
         tabs = list_tabs()
         # 查询失败就整体退出(非零),herdr 会记为 failed;下次事件再触发时重试。
@@ -1281,6 +1347,9 @@ def _handle_event(pane_id: str, status: str, data: dict) -> int:
             entry["rechecked"] = True
         elif action == "reuse":
             entry["final_done"] = True
+        # 仅成功写入后才确认新会话已接管标题；写失败时下次重试仍不把旧标题
+        # 传给 provider，避免 /new 后退回上一任务的语义。
+        entry.pop("session_rollover", None)
     else:
         warn(f"{pane_id}: failed to write title; will retry on next event")
     commit_event(pane_id, generation, revision, entry)

@@ -15,6 +15,8 @@
     3. working + settled 双停靠:按 draft -> settle 顺序消费;同轮内容
        指纹短路,定稿复用初稿标题。
     4. reset 与生成进程并发:pane_lock 排队,撤销已消费的全部结果。
+    5. provider 执行期间原生会话切换:新会话的 working + settled 均停靠,
+       旧调用结束后重新生成初稿与定稿。
 
 形态
     unittest 测试模块。每个用例通过 subprocess 以 herdr 实际 spawn hook
@@ -206,6 +208,12 @@ class E2EOfflineTests(unittest.TestCase):
                     "label": None,
                     "terminal_title_stripped": None,
                     "cwd": "/tmp",
+                    "agent_session": {
+                        "source": "herdr:pi",
+                        "agent": "pi",
+                        "kind": "path",
+                        "value": "/tmp/pi-session-old.jsonl",
+                    },
                 }
             },
         )
@@ -254,6 +262,11 @@ class E2EOfflineTests(unittest.TestCase):
 
     def set_titles(self, titles: list) -> None:
         self.write_fixture("titles.json", titles)
+
+    def set_agent_session(self, session: dict) -> None:
+        panes = json.loads((self.fixtures / "panes.json").read_text(encoding="utf-8"))
+        panes["w1:p1"]["agent_session"] = session
+        self.write_fixture("panes.json", panes)
 
     def env_for_event(self, status: str) -> dict:
         env = dict(os.environ)
@@ -342,6 +355,12 @@ class E2EOfflineTests(unittest.TestCase):
                         "generation": 0,
                         "revision": 1,
                         "agent": "pi",
+                        "agent_session": {
+                            "source": "herdr:pi",
+                            "agent": "pi",
+                            "kind": "path",
+                            "value": "/tmp/pi-session-old.jsonl",
+                        },
                     }
                 },
                 ensure_ascii=False,
@@ -378,6 +397,58 @@ class E2EOfflineTests(unittest.TestCase):
         self.assertNotIn("pending_settle", entry)
         self.assertEqual(entry["calls"], 2)
         self.assertEqual(self.provider_calls(), 2)
+
+    def test_session_switch_during_provider_keeps_new_session_final_title(self) -> None:
+        """跨进程验证：/new 在旧 provider 期间不会丢掉新会话的定稿。"""
+        self.write_recent(1, "旧会话的 prompt 内容足够生成初稿标题")
+        self.write_recent(2, "新会话的 prompt 内容足够生成初稿标题")
+        self.write_recent_last("新会话的 prompt 加第一轮回复足够生成定稿标题")
+        self.set_titles(["旧会话初稿", "新会话初稿", "新会话定稿"])
+        self.seed_round_in_progress()
+        # seed_round_in_progress 的 last_status=working 会让首个 idle 走 final；
+        # 本场景需要旧会话的 T0，因此仅保留会话身份和空闲前史。
+        state = self.state()
+        state["w1:p1"].update({"rounds": 0, "last_status": "idle"})
+        (self.plugin_state / "state.json").write_text(
+            json.dumps(state, ensure_ascii=False), encoding="utf-8"
+        )
+
+        old_proc = self.spawn_event("working")
+        self.await_provider()
+
+        new_session = {
+            "source": "herdr:pi",
+            "agent": "pi",
+            "kind": "path",
+            "value": "/tmp/pi-session-new.jsonl",
+        }
+        self.set_agent_session(new_session)
+        # /new 后的两个事件都在旧调用持锁时到达，只能先停靠。
+        working_proc = self.run_event("working")
+        done_proc = self.run_event("done")
+        self.assertEqual(working_proc.returncode, 0, working_proc.stderr)
+        self.assertEqual(done_proc.returncode, 0, done_proc.stderr)
+        parked = self.entry()
+        self.assertTrue(parked["pending_draft"])
+        self.assertTrue(parked["pending_settle"])
+
+        self.release_provider()
+        old_proc.communicate(timeout=60)
+        self.assertEqual(old_proc.returncode, 0)
+
+        self.assertEqual(
+            self.rename_calls(),
+            ["w1:t1 旧会话初稿", "w1:t1 新会话初稿", "w1:t1 新会话定稿"],
+        )
+        entry = self.entry()
+        self.assertEqual(entry["agent_session"], new_session)
+        self.assertEqual(entry["calls"], 2)
+        self.assertTrue(entry["draft_done"])
+        self.assertTrue(entry["final_done"])
+        self.assertNotIn("pending_draft", entry)
+        self.assertNotIn("pending_settle", entry)
+        self.assertNotIn("session_rollover", entry)
+        self.assertEqual(self.provider_calls(), 3)
 
     def test_working_event_parked_and_skipped_when_final_wins(self) -> None:
         """场景 2:final 持锁期间 working 停靠;final 成功后 draft 跳过不烧调用。"""
@@ -485,7 +556,8 @@ class E2EOfflineTests(unittest.TestCase):
         self.assertNotIn("final_done", entry)
         self.assertNotIn("pending_draft", entry)
         self.assertNotIn("pending_settle", entry)
-        self.assertEqual(entry["generation"], 1)
+        # 首次有原生会话身份时 generation 递增一次，reset 再递增一次。
+        self.assertEqual(entry["generation"], 2)
 
 
 if __name__ == "__main__":
