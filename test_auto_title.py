@@ -227,6 +227,19 @@ class AutoTitleBehaviorTests(unittest.TestCase):
     def test_working_event_during_blocked_final_skips_draft_when_final_wins(self) -> None:
         """final 持锁时到达的 working 事件持久化意图;final 已给出标题则 draft 不再烧调用。"""
         self.configure_tab_world()
+        # 预置“第一轮已完成、等待 final”的前史,否则 idle 事件(修复后)不触发 final。
+        auto_title.save_state(
+            {
+                "w1:p1": {
+                    "rounds": 1,
+                    "calls": 0,
+                    "last_status": "working",
+                    "generation": 0,
+                    "revision": 1,
+                    "agent": "pi",
+                }
+            }
+        )
         gate = threading.Event()
         entered_provider = threading.Event()
 
@@ -367,6 +380,18 @@ class AutoTitleBehaviorTests(unittest.TestCase):
     def test_parked_draft_and_settle_intents_merge_and_consume_in_order(self) -> None:
         """final 失败后,停靠的 working 与 done 意图按 draft -> settle 顺序消费。"""
         self.configure_tab_world()
+        auto_title.save_state(
+            {
+                "w1:p1": {
+                    "rounds": 1,
+                    "calls": 0,
+                    "last_status": "working",
+                    "generation": 0,
+                    "revision": 1,
+                    "agent": "pi",
+                }
+            }
+        )
         gate = threading.Event()
         entered_provider = threading.Event()
         generate_results = iter([None, "初稿标题"])
@@ -453,6 +478,29 @@ class AutoTitleBehaviorTests(unittest.TestCase):
             self.assertFalse(
                 auto_title.tab_is_unnamed({"label": "插桩工具验收", "number": "3"})
             )
+
+    def test_agent_startup_idle_does_not_burn_a_provider_call(self) -> None:
+        """agent 启动 ready 的 idle(unknown→idle)不递增 rounds,不触发 final。"""
+        self.configure(target="tab")
+        pane = self.make_tab_pane()
+        event = {"data": {"pane_id": "w1:p1", "agent_status": "idle", "agent": "pi"}}
+        with (
+            patch.dict(os.environ, {"HERDR_PLUGIN_EVENT_JSON": json.dumps(event)}),
+            patch.object(auto_title, "get_pane", return_value=pane),
+            patch.object(auto_title, "list_tabs", return_value={
+                "w1:t1": {"tab_id": "w1:t1", "label": "1", "number": "1"}}),
+            patch.object(auto_title, "first_agent_panes", return_value={"w1:t1": "w1:p1"}),
+            patch.object(auto_title, "read_pane") as read,
+            patch.object(auto_title, "generate_title") as generate,
+            patch.object(auto_title, "rename_tab") as rename,
+        ):
+            self.assertEqual(auto_title.handle_event(), 0)
+        read.assert_not_called()
+        generate.assert_not_called()
+        rename.assert_not_called()
+        entry = auto_title.load_state()["w1:p1"]
+        self.assertEqual(entry["rounds"], 0)
+        self.assertEqual(entry["calls"], 0)
 
     def test_clear_does_not_overwrite_a_tab_renamed_by_user(self) -> None:
         self.configure(target="tab")

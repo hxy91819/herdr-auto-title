@@ -1036,6 +1036,11 @@ def begin_event(pane_id: str, status: str, data: dict) -> tuple[dict, int, int]:
 
     返回的快照剥离停靠标志：标志的生命周期由 mark/clear 独占管理，
     避免账目提交把并发停靠的新事件意图覆盖掉。
+
+    rounds 只在 working→idle 跃变时递增：agent 启动 ready 的 idle
+    (unknown→idle)也算 idle 跃变，若让它递增，decide 会对只有欢迎屏的
+    空面板烧一次 provider 调用(实测每个新 pane 都这样浪费一次，且常
+    返回 NO_TITLE)。存量 pane 的补标题职责在 once 命令，不在事件路径。
     """
     with state_lock():
         state = load_state()
@@ -1051,7 +1056,7 @@ def begin_event(pane_id: str, status: str, data: dict) -> tuple[dict, int, int]:
         )
         entry.setdefault("generation", 0)
         entry["revision"] = entry.get("revision", 0) + 1
-        if status == "idle" and entry.get("last_status") != "idle":
+        if status == "idle" and entry.get("last_status") == "working":
             entry["rounds"] = entry.get("rounds", 0) + 1
         entry["last_status"] = status
         entry["seen"] = time.time()

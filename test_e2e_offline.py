@@ -330,6 +330,25 @@ class E2EOfflineTests(unittest.TestCase):
 
     # ------------------------------------------------------------ 场景
 
+    def seed_round_in_progress(self) -> None:
+        """预置“第一轮 prompt 已发出、agent 刚回完成”的真实状态前史。"""
+        (self.plugin_state / "state.json").write_text(
+            json.dumps(
+                {
+                    "w1:p1": {
+                        "rounds": 1,
+                        "calls": 0,
+                        "last_status": "working",
+                        "generation": 0,
+                        "revision": 1,
+                        "agent": "pi",
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
     def test_settled_event_during_blocked_t0_parks_then_consumes(self) -> None:
         """场景 1:T0 持锁期间的 done 事件停靠,释放后 T1 消费并二次写 tab。"""
         self.write_recent(1, "第一个 prompt 上屏后的会话内容足够生成初稿标题")
@@ -365,6 +384,7 @@ class E2EOfflineTests(unittest.TestCase):
         self.write_recent(1, "第一轮回复后屏幕上已有完整对话内容可以定稿")
         self.write_recent_last("不会被读取的内容")
         self.set_titles(["定稿标题"])
+        self.seed_round_in_progress()
 
         final_proc = self.spawn_event("idle")
         self.await_provider()
@@ -391,6 +411,7 @@ class E2EOfflineTests(unittest.TestCase):
         self.write_recent(1, "第一轮回复后屏幕上已有完整对话内容可以定稿")
         self.write_recent_last("prompt 上屏后的会话内容足够生成初稿标题")
         self.set_titles([None, "初稿标题"])
+        self.seed_round_in_progress()
 
         final_proc = self.spawn_event("idle")
         self.await_provider()
