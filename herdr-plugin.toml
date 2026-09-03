@@ -1,0 +1,18 @@
+id = "herdr-auto-title"
+name = "Auto Title"
+version = "0.1.0"
+min_herdr_version = "0.8.2"
+description = "Generate short task titles for agent panes using a local coding agent CLI"
+platforms = ["linux", "macos", "windows"]
+
+# 事件驱动:agent 状态一变就触发,无需轮询。
+# herdr 在 spawn 后不等命令结束(后台线程),并且自己限流 32 个并发。
+[[events]]
+on = "pane.agent_status_changed"
+platforms = ["linux", "macos"]
+command = ["python3", "auto_title.py"]
+
+[[events]]
+on = "pane.agent_status_changed"
+platforms = ["windows"]
+command = ["py", "-3", "auto_title.py"]

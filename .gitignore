@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+# 运行产物与本地隐私(正常不在仓库目录,防御性排除)
+*.log
+state.json
+.env*
+*.key
+*.pem
+workdir/
